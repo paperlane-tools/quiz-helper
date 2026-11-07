@@ -77,4 +77,4 @@
 
 ## 许可证
 
-[GPL-3.0-only](LICENSE) © 2026 paperlane-tools；修改版须注明来源（见 [NOTICE](NOTICE)）
+[GPL-3.0-only](LICENSE) © 2026 paperlane-tools；附加条款（署名 / 修改标注 / 名称使用 / 随附条款）见 [NOTICE](NOTICE)
