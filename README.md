@@ -77,4 +77,4 @@
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 paperlane-tools
+[PolyForm Noncommercial 1.0.0](LICENSE) © 2026 paperlane-tools
