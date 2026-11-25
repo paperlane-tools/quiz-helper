@@ -1,0 +1,39 @@
+# Local secrets and sessions
+.env
+.env.*
+!.env.example
+config.json
+ai_config.json
+session*.json
+*_session*.json
+session_storage.json
+cookies*.json
+*token*.json
+
+# Browser profiles and runtime data
+browser-profile/
+*.profile/
+work/
+outputs/
+backups/
+logs/
+
+# User data exports
+yzj-bank-*.json
+yzj-bank-*.csv
+yzj-log-*.txt
+*.bak
+
+# Python / Node / editors
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.venv/
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+
