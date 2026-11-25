@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         易智教云课堂 · 自动作答助手
 // @namespace    yzj-js
-// @version      1.6.2
-// @description  在已登录的 csgmooc 页面上，一键把整套题交给 AI 判题并自动填入答案（单选/多选/判断/填空/连线，支持多家 AI 服务商、自动检测可用模型、自动交卷与跳过规则）
+// @version      1.6.6
+// @description  在已登录的 csgmooc 页面上，一键把整套题交给 AI 判题并自动填入答案（支持文字/图片题、数学公式识别、单选/多选/判断/填空/连线，支持多家 AI 服务商、自动检测可用模型、自动交卷与跳过规则）
 // @author       yzj-js
 // @match        https://www.csgmooc.com/*
 // @grant        GM_getValue
@@ -17,7 +17,7 @@
 (function () {
   "use strict";
 
-const YZJ_VERSION = "1.6.2";
+const YZJ_VERSION = "1.6.6";
 
   // ------------------------------------------------ v1.4.0：题型与跳过规则
   /** 站点题型编号（取自站点自己的模板与 stud_add_test.min.js） */
@@ -664,6 +664,28 @@ const YZJ_VERSION = "1.6.2";
     });
   }
 
+  /** Tampermonkey 专用下载通道：可绕开页面 CSP 对 fetch 的限制。 */
+  function gmFetchImageBlob(url) {
+    return new Promise((resolve, reject) => {
+      let handle = null;
+      const done = (fn) => (arg) => { if (handle) inflight.delete(handle); fn(arg); };
+      handle = GM_xmlhttpRequest({
+        method: "GET", url, responseType: "blob", timeout: Math.max(20000, CFG.timeoutSec * 1000),
+        onload: done((res) => {
+          if (res.status >= 200 && res.status < 400 && res.response instanceof Blob) {
+            resolve(res.response);
+          } else {
+            reject(new Error(`图片请求失败（HTTP ${res.status || "?"}）`));
+          }
+        }),
+        onerror: done((e) => reject(new Error("图片下载失败：" + ((e && e.error) || "unknown")))),
+        ontimeout: done(() => reject(new Error("图片下载超时"))),
+        onabort: done(() => reject(new Error("已取消"))),
+      });
+      if (handle) inflight.add(handle);
+    });
+  }
+
   /** 顶部进度条（可取消），用来避免"看着像卡死" */
   let progressEl = null;
   function showProgress(text, onCancel) {
@@ -724,9 +746,8 @@ const YZJ_VERSION = "1.6.2";
     try { return JSON.parse(text); } catch { return { raw: text }; }
   }
 
-  async function imageToDataUrl(url) {
-    const blob = await fetchImageBlob(url);
-    return await new Promise((resolve, reject) => {
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
       const fr = new FileReader();
       fr.onload = () => resolve(fr.result);
       fr.onerror = reject;
@@ -734,11 +755,76 @@ const YZJ_VERSION = "1.6.2";
     });
   }
 
+  /**
+   * 数学题、公式题常以很小的横条图片存放（例如 457×74）。原图直接送给
+   * 视觉模型时，上下标、根号和小数点容易糊掉。这里只对小图做无损放大，
+   * 大图保持原样；失败则悄悄退回原图，不影响判题流程。
+   */
+  function upscaleImageBlob(blob) {
+    return new Promise((resolve) => {
+      if (!blob || !/^image\//i.test(String(blob.type || ""))
+          || typeof document === "undefined" || typeof Image === "undefined") {
+        resolve("");
+        return;
+      }
+      const objectUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      const finish = (value) => {
+        try { URL.revokeObjectURL(objectUrl); } catch { /* ignore */ }
+        resolve(value || "");
+      };
+      img.onload = () => {
+        try {
+          const srcW = Number(img.naturalWidth || img.width) || 0;
+          const srcH = Number(img.naturalHeight || img.height) || 0;
+          const longest = Math.max(srcW, srcH);
+          if (!srcW || !srcH || longest >= 1600) { finish(""); return; }
+          const scale = longest < 900 ? 3 : 1.5;
+          const outW = Math.round(srcW * scale);
+          const outH = Math.round(srcH * scale);
+          if (outW > 2400 || outH > 2400 || outW * outH > 4200000) { finish(""); return; }
+          const canvas = document.createElement("canvas");
+          canvas.width = outW;
+          canvas.height = outH;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) { finish(""); return; }
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(0, 0, outW, outH);
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+          ctx.drawImage(img, 0, 0, outW, outH);
+          finish(canvas.toDataURL("image/png"));
+        } catch {
+          finish("");
+        }
+      };
+      img.onerror = () => finish("");
+      img.src = objectUrl;
+    });
+  }
+
+  async function imageToDataUrl(url) {
+    const blob = await fetchImageBlob(url);
+    const enhanced = await upscaleImageBlob(blob);
+    return enhanced || blobToDataUrl(blob);
+  }
+
   // 图片只下载一次：AI 取图 + 算指纹共用（同一次运行内缓存）
   const imageBlobCache = new Map();
   async function fetchImageBlob(url) {
     if (imageBlobCache.has(url)) return imageBlobCache.get(url);
-    const p = fetch(url, { credentials: "include" }).then((r) => r.blob());
+    const p = (async () => {
+      try {
+        return await fetch(url, { credentials: "include" }).then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.blob();
+        });
+      } catch (e) {
+        if (/^data:/i.test(url)) throw e;
+        logLine("warn", `原生 fetch 取图失败，改用 Tampermonkey 通道：${e.message}`);
+        return gmFetchImageBlob(url);
+      }
+    })().catch((e) => { imageBlobCache.delete(url); throw e; });
     imageBlobCache.set(url, p);
     return p;
   }
@@ -964,12 +1050,19 @@ const YZJ_VERSION = "1.6.2";
               cells.push(n ? sum / n : 0);
             }
           }
+          const inkCells = cells.filter((v) => v > 0.005);
+          if (inkCells.length < 4) { resolve(""); return; }
           const med = cells.slice().sort((a, b) => a - b)[32];
+          // 多格同为 0 时，med 往往也是 0。若使用 v >= med，会得到
+          // ffffffffffffffff，导致不同试卷误判成同一张。这里给零值设下限，
+          // 并对全 0/全 1 的退化指纹直接判无效。
           let bits = "";
-          cells.forEach((v) => { bits += v >= med ? "1" : "0"; });
+          cells.forEach((v) => {
+            bits += (med > 0.005 ? v >= med : v > 0.005) ? "1" : "0";
+          });
           let hex = "";
           for (let i = 0; i < 64; i += 4) hex += parseInt(bits.slice(i, i + 4), 2).toString(16);
-          resolve(hex);
+          resolve(hex === "0000000000000000" || hex === "ffffffffffffffff" ? "" : hex);
         } catch (e) { reject(e); } finally { URL.revokeObjectURL(url); }
       };
       img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("图片解码失败")); };
@@ -1574,6 +1667,25 @@ const YZJ_VERSION = "1.6.2";
       .replace(/\s+/g, " ").trim();
   }
 
+  function absoluteAssetUrl(src) {
+    const s = String(src || "").trim();
+    if (!s) return "";
+    try { return new URL(s, location.href).href; } catch { return s; }
+  }
+
+  /** 从题干/选项 HTML 中提取图片。数学题通常把整个公式题干放在这里。 */
+  function extractImageUrls(html) {
+    const out = [];
+    const seen = new Set();
+    const re = /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi;
+    let m;
+    while ((m = re.exec(String(html || "")))) {
+      const url = absoluteAssetUrl(m[1]);
+      if (url && !seen.has(url)) { seen.add(url); out.push(url); }
+    }
+    return out;
+  }
+
   /** 站点单题 → 内部结构（blanks：填空题一个 optionJson 就是一个空） */
   function mapQuestion(q) {
     const opts = q.optionJsons || [];
@@ -1583,11 +1695,17 @@ const YZJ_VERSION = "1.6.2";
       .sort((a, b) => Number(a.no) - Number(b.no));
     const right = opts.filter((o) => Number.isNaN(Number(String(o.number).trim())))
       .map((o) => ({ key: String(o.number).trim().toUpperCase(), text: stripHtml(o.option) }));
+    const images = [];
+    const imgSeen = new Set();
+    for (const u of extractImageUrls(q.q_desc).concat(...opts.map((o) => extractImageUrls(o.option)))) {
+      if (u && !imgSeen.has(u)) { imgSeen.add(u); images.push(u); }
+    }
     return {
       id: q.sqid,
       type: Number(q.q_type),
       typeName: Q_TYPE_NAME[Number(q.q_type)] || `未知(${q.q_type})`,
       desc: stripHtml(q.q_desc),
+      images,
       options: opts.map((o) => ({ letter: String(o.number || "").toUpperCase(), text: stripHtml(o.option) })),
       blanks: opts.length,
       left, right,
@@ -1765,7 +1883,9 @@ const YZJ_VERSION = "1.6.2";
     const offset = opt.offset || 0;
     const noReason = !!opt.noReason;
     const head = [
-      "你是试卷判题程序。下面是试卷的文字版（题干 + 选项）。",
+      "你是通用试卷判题程序。题干和选项可能以文字、图片或两者混合提供；必须把附件图片与下面的题号、选项一起理解。",
+      "数学题要逐字识别数字、正负号、小数点、分式、根号、上下标、排列组合符号和几何条件；拿不准时结合选项反推，不要因为公式排版复杂就判成“无法识别”。",
+      "选择题只能使用本题下列选项里真实存在的字母，绝对不能输出未列出的 E/F/G/H 等字母；选项图片内容也要与题干图片对应。",
       `任务：${taskName || ""}`,
       "请为每一题给出答案，并只输出如下 json（不要任何其它文字、不要代码块）：",
       noReason ? `{"answers":[{"no":${offset + 1},"answer":"A"}]}`
@@ -1779,7 +1899,7 @@ const YZJ_VERSION = "1.6.2";
       const opts = (q.options || []).map((o) => `${o.letter}. ${o.text}`).join("   ");
       // 连线题经常没有题干，别骗模型"题干见图片"——它会以为有图却看不到
       const stem = q.desc || (Number(q.type) === Q_TYPE.LINE
-        ? "（没有题干，内容在下面的左右两列）" : "（题干见图片）");
+        ? "（没有题干，内容在下面的左右两列）" : "（题干见随附图片）");
       const lines = [`第${offset + i + 1}题【${Q_TYPE_NAME[Number(q.type)] || "未知"}】：${stem}`];
       if (Number(q.type) === Q_TYPE.LINE && (q.left || []).length && (q.right || []).length) {
         // 连线题：左右两侧分开列，避免模型把它们当成一堆选项
@@ -1798,8 +1918,9 @@ const YZJ_VERSION = "1.6.2";
     const offset = opt.offset || 0;
     const noReason = !!opt.noReason;
     return [
-      "你是一个英语试卷判题程序。下面给你一张试卷图片（图片版试卷，题目和选项都在图里）。",
-      "题号按空位在文章中出现的先后顺序编号（第 1 个空 = 第 1 题），**不要用图片上印的编号**。",
+      "你是通用试卷判题程序。随附图片可能是英语、数学、专业课或混合题型；请直接识别图中的文字、数字和公式。",
+      "数学公式要特别注意分式、根号、上下标、正负号、小数点、排列组合符号和几何条件；不要因为公式排版复杂而放弃。",
+      "题号按题目或空位在图片中出现的先后顺序编号（第 1 题 = 第 1 项），**不要用图片上印的编号**。",
       `本次只需要回答第 ${offset + 1} 到第 ${offset + count} 个空（共 ${count} 个）。`,
       `任务：${taskName || ""}`,
       "请为每一题选出正确选项，并只输出如下 JSON（不要输出任何其它文字、不要用代码块）：",
@@ -1928,8 +2049,10 @@ const YZJ_VERSION = "1.6.2";
    * 分批判题。ranges 为空时处理 [0,count) 全部；
    * 传 ranges=[[a,b),…] 时只处理这些区间（题库命中的题就不用问了）。
    */
-  async function askAI({ imageUrls = [], questions = null, count, taskName, ranges = null }) {
-    const size = CFG.batchSize;
+  async function askAI({ imageUrls = [], imageGroups = null, questions = null, count, taskName, ranges = null }) {
+    // 图片题强制一题一请求：数学题常由“题干图 + 多个公式/选项图”组成，
+    // 多题混批会造成图片与题号串位，也容易触发请求体过大。
+    const size = imageGroups ? 1 : CFG.batchSize;
     const out = [];
     const failedRanges = [];      // v1.4.0：这些题号范围的模型没判出来（只跳过它们，不整卷失败）
     let lastErrAll = null;        // v1.4.9：跨批次记住最后一次真实错误，供上层写进"跳过理由"
@@ -1942,6 +2065,11 @@ const YZJ_VERSION = "1.6.2";
     for (const [from, to] of plan) {
       const n = to - from;
       const sliceQs = questions ? questions.slice(from, to) : null;
+      // 当前答题页可以逐题采图时，只把本批对应的图片发给模型，避免 6 道题
+      // 共用整卷时张冠李戴；接口只给整卷图片时仍沿用原来的 imageUrls。
+      const batchImages = imageGroups
+        ? imageGroups.slice(from, to).flat()
+        : (imageUrls.length === count ? imageUrls.slice(from, to) : imageUrls);
       // 简答题要写正文，预算给足（v1.4.1）
       const isSubject = !!(sliceQs && sliceQs.some((q) => Number(q.type) === Q_TYPE.SUBJECTIVE));
 
@@ -1956,7 +2084,7 @@ const YZJ_VERSION = "1.6.2";
         const att = attempts[ai];
         try {
           got = await askOnce({
-            imageUrls, questions: sliceQs, count: n, taskName, noReason: CFG.noReason, offset: from,
+            imageUrls: batchImages, questions: sliceQs, count: n, taskName, noReason: CFG.noReason, offset: from,
             maxTokens: budgetFor(n, CFG.noReason, att.level, isSubject), effort: att.effort,
           });
           if (got && got.answers && got.answers.length) break;
@@ -2032,6 +2160,57 @@ const YZJ_VERSION = "1.6.2";
       name: nameEl ? nameEl.textContent.trim() : "",
       title: titleEl ? (titleEl.getAttribute("title") || "") : "",
     };
+  }
+
+  /**
+   * v1.6.3：历史课堂里的教学活动使用 stud_teachTask.html，点“查看任务”后
+   * 才跳到 spoc4 答题页。它和旧任务列表（li.contentLi）不是同一套 DOM。
+   * 这段会把站点自己写进 sessionStorage 的班级/课程上下文一起保存下来。
+   */
+  function infoFromCourseCard(el) {
+    const row = el && el.closest ? (el.closest(".lookTaskBottom") || el) : null;
+    if (!row) return null;
+    const tmid = row.getAttribute("tmid") || "";
+    if (!tmid) return null;
+    const ttype = row.getAttribute("ttype") || "";
+    return {
+      tmid,
+      sclassid: sessionStorage.getItem("stucalendar:sclassid") || "",
+      tcid: sessionStorage.getItem("stu_teachtask:scid")
+        || (document.querySelector("#teachName") && document.querySelector("#teachName").getAttribute("scid")) || "",
+      ttid: sessionStorage.getItem("indexpage:ttid") || "",
+      submitId: "",
+      homeworkid: "",
+      name: row.getAttribute("tmname") || String(row.textContent || "").trim(),
+      title: ttype === "0" ? "测试" : "",
+      taskType: ttype,
+      taskStatus: row.getAttribute("taskstatu") || "",
+      ptype: row.getAttribute("ptype") || "",
+      courseTask: true,
+    };
+  }
+
+  /**
+   * spoc4 的入口 URL 只带 tmid/sclassid/tcid，真正的 submitId 由站点再查一次。
+   * 历史课堂任务卡没有 tm_subid，所以这里补齐；旧任务卡已有 submitId 时不发请求。
+   */
+  async function ensureTaskIds(info) {
+    if (!info || !info.tmid) throw new Error("任务上下文缺少 tmid");
+    if (info.homeworkid) return info;
+    if (!info.sclassid) throw new Error("没识别到班级 ID（sclassid）");
+    if (!info.submitId) {
+      const qs = new URLSearchParams({ tmid: info.tmid, sclassid: info.sclassid });
+      const r = await api("student/testvalidatedetail/getModuleStatusAndLastTime?" + qs.toString());
+      const list = Array.isArray(r && r.data) ? r.data : (r && r.data ? [r.data] : []);
+      const row = list[0] || {};
+      if (row.submitId !== undefined && row.submitId !== null) info.submitId = String(row.submitId);
+      if (!info.tcid && row.tcid !== undefined && row.tcid !== null) info.tcid = String(row.tcid);
+      if (!info.ttid && row.ttid !== undefined && row.ttid !== null) info.ttid = String(row.ttid);
+      if (info.submitId) logLine("info", `已补齐任务上下文：tmid=${info.tmid} submitId=${info.submitId}`);
+    }
+    if (!info.tcid) throw new Error("没识别到课程 ID（tcid）");
+    if (!info.submitId) throw new Error("任务尚未开始或服务器没有返回 submitId");
+    return info;
   }
 
   let busy = false;
@@ -2169,6 +2348,10 @@ const YZJ_VERSION = "1.6.2";
         if (r && r.data && r.data.flag === 1) ok += 1;
         await sleep(150);
       }
+      if (onTestPage()) {
+        const painted = await paintCurrentTestAnswers(byNo);
+        if (painted) say(`答题页已同步 ${painted} 题（服务器也已保存）`);
+      }
       say(`写入完成：${ok}/${questions.length} 题成功` + (skipped ? `，${skipped} 题留空（模型判不了）` : "") + "。");
       histAdd({ at: Date.now(), tmid: String(info.tmid), name: info.name, title: info.title,
                 count: questions.length, answers: byNo, keys: keysByNo, tokens: lastUsage,
@@ -2219,6 +2402,7 @@ const YZJ_VERSION = "1.6.2";
    * 返回 {verdict:"ok"|"skip", kind, reason, ids, questions}
    */
   async function inspectTask(info) {
+    await ensureTaskIds(info);
     // 1) 有 homeworkid → 作业页那套接口（v1.4.1：主观题也能答，正文走 subResult）
     if (info.homeworkid) {
       let d = null;
@@ -2283,10 +2467,28 @@ const YZJ_VERSION = "1.6.2";
     if (insp.homework) return judgeHomework(info, insp);
     const questions = insp.ids;
 
-    const paper = await api(`student/testvalidatedetail/gettestpaperofimage?tmid=${info.tmid}`);
-    const urls = ((paper.data || {}).attrlist || []).map((a) => "https://www.csgmooc.com" + a.imgurl);
     const qs = insp.questions && insp.questions.length ? insp.questions : null;
+    // v1.6.5：数学题在 getquestionsum 的 q_desc HTML 里就带图片 URL。
+    // 自动流程运行在任务列表页，没有答题页 DOM，因此必须优先用这里的逐题图片。
+    const questionImageGroups = qs ? qs.map((q) => (q.images || []).slice()) : [];
+    const questionImages = questionImageGroups.flat();
+    const paper = await api(`student/testvalidatedetail/gettestpaperofimage?tmid=${info.tmid}`);
+    let urls = ((paper.data || {}).attrlist || []).map((a) => "https://www.csgmooc.com" + a.imgurl);
+    let domImageGroups = [];
+    if (questionImages.length) {
+      urls = questionImages;
+      logLine("info", `已从 getquestionsum 题干提取 ${questionImages.length} 张题图`);
+    } else {
+      // 当前就在答题页时再尝试 DOM 逐题采图。
+      domImageGroups = collectCurrentTestImages ? await collectCurrentTestImages() : [];
+      const domUrls = domImageGroups.flat();
+      if (!urls.length && domUrls.length) {
+        urls = domUrls;
+        logLine("info", `接口没有返回试卷图片，已从答题页采集 ${urls.length} 张题图`);
+      }
+    }
     // v1.6.2：连线题的题干是空的，但左右选项就是内容 —— 用 hasSendableText 判，别再只数 desc
+    const typedOk = !!(qs && qs.length === questions.length);
     const textCount = qs ? qs.filter(hasSendableText).length : 0;
     const textOk = !!(qs && qs.length === questions.length
       && textCount >= Math.ceil(questions.length * 0.6));
@@ -2319,7 +2521,7 @@ const YZJ_VERSION = "1.6.2";
       let norm = "";
       try {
         // 文字版：命中答案必须按该题题型合法（多选/填空同样校验），否则当作不可信
-        norm = textOk ? normalizeAnswer(qs[i], hit.a, idx) : String(hit.a).toUpperCase();
+        norm = typedOk ? normalizeAnswer(qs[i], hit.a, idx) : String(hit.a).toUpperCase();
       } catch (e) {
         logLine("warn", `题库命中第${idx}题但不可信（${e.message}），忽略该条`);
         continue;
@@ -2341,7 +2543,11 @@ const YZJ_VERSION = "1.6.2";
       });
       say(`题库命中 ${questions.length - missIdx.length}/${questions.length} 题，剩 ${missIdx.length} 题问 AI`);
       const aiRes = await askAI({
-        imageUrls: textOk ? [] : urls, questions: textOk ? qs : null,
+        imageUrls: textOk ? [] : urls,
+        imageGroups: textOk ? null
+          : (questionImageGroups.some((x) => x.length) ? questionImageGroups
+            : (domImageGroups.some((x) => x.length) ? domImageGroups : null)),
+        questions: typedOk ? qs : null,
         count: questions.length, taskName: `${info.name} ${info.title}`, ranges,
       });
       ((aiRes && aiRes.answers) || []).forEach((a) => {
@@ -2362,7 +2568,7 @@ const YZJ_VERSION = "1.6.2";
     }
 
     // S6 + v1.4.0：文字版按题型校验并归一化（多选 ABD、填空 a#CSG#b）；不合法就整卷不写
-    if (textOk) {
+    if (typedOk) {
       const invalid = [];
       for (let i = 0; i < qs.length; i += 1) {
         const n = i + 1;
@@ -2394,7 +2600,7 @@ const YZJ_VERSION = "1.6.2";
     if (hardMissing.length) throw new Error("模型漏答：" + hardMissing.join(","));
 
     const answerText = {};
-    if (textOk) {
+    if (typedOk) {
       qs.forEach((q, i) => {
         const got = byNo[i + 1];
         if (!got) return;
@@ -2551,6 +2757,7 @@ const YZJ_VERSION = "1.6.2";
       }
       heartbeatLock();
     }
+    if (onTestPage()) await paintCurrentTestAnswers(byNo);
     return { ok, skipped, total: questions.length, answers: byNo, count: questions.length };
   }
 
@@ -3517,8 +3724,109 @@ const YZJ_VERSION = "1.6.2";
     return location.pathname.includes("/spoc4") || location.hash.includes("student-test");
   }
 
+  /**
+   * 从当前 spoc4 答题页逐题收集题干/选项里的图片。
+   * 返回数组下标对应题号：[[题1图片...], [题2图片...], ...]。
+   * 结束时切回用户原来的题目，不改变作答内容。
+   */
+  async function collectCurrentTestImages() {
+    const cards = [...document.querySelectorAll(".question-type-list .question-list .question-number[data-index]")];
+    if (!cards.length) return [];
+    const titleNow = (document.querySelector(".question-type-index") || {}).innerText || "";
+    const now = (titleNow.match(/第\s*(\d+)\s*题/) || [])[1];
+    const original = Math.max(0, Math.min(cards.length - 1, Number(now || 1) - 1));
+    const groups = [];
+    for (let i = 0; i < cards.length; i += 1) {
+      cards[i].click();
+      for (let wait = 0; wait < 12; wait += 1) {
+        await sleep(80);
+        const title = document.querySelector(".question-type-index");
+        if (!title || title.innerText.includes(`第${i + 1}题`)) break;
+      }
+      const current = document.querySelector(".question-content");
+      const imgs = current ? [...current.querySelectorAll(".question-title img, .question-option img, .question-info img")] : [];
+      const seen = new Set();
+      groups[i] = [];
+      for (const img of imgs) {
+        const src = img.currentSrc || img.src || img.getAttribute("data-src") || "";
+        if (!src || seen.has(src)) continue;
+        seen.add(src);
+        groups[i].push(src);
+      }
+    }
+    if (cards[original]) cards[original].click();
+    return groups;
+  }
+
+  /**
+   * v1.6.3：接口保存后同步操作当前答题页。
+   * 站点页面使用 Vue 状态，单靠 saveQuestionRecord 不会立刻刷新答题卡；
+   * 这里按题号切题，再点击选项或填写输入框，让用户能直接看见答案已经写入。
+   * 失败时不影响服务器端已经保存的结果。
+   */
+  async function paintCurrentTestAnswers(byNo) {
+    const cards = [...document.querySelectorAll(".question-type-list .question-list .question-number[data-index]")];
+    if (!cards.length || !byNo) return 0;
+    let painted = 0;
+    for (let i = 0; i < cards.length; i += 1) {
+      const answer = String(byNo[i + 1] || "").trim();
+      if (!answer) continue;
+      const card = cards[i];
+      card.click();
+      for (let wait = 0; wait < 12; wait += 1) {
+        await sleep(80);
+        const title = document.querySelector(".question-type-index");
+        if (!title || title.innerText.includes(`第${i + 1}题`)) break;
+      }
+
+      const current = document.querySelector(".question-content");
+      if (!current) continue;
+      const options = [...current.querySelectorAll(".question-option")];
+      if (options.length && /^[A-Z]+$/i.test(answer)) {
+        let clicked = 0;
+        for (const letter of answer.toUpperCase().split("")) {
+          const hit = options.find((o) => {
+            const no = o.querySelector(".question-number");
+            return String((no && no.textContent) || "").trim().toUpperCase() === letter;
+          });
+          if (hit) { hit.click(); clicked += 1; await sleep(100); }
+        }
+        if (clicked) { painted += 1; continue; }
+      }
+
+      const inputs = [...current.querySelectorAll(
+        'input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), textarea, [contenteditable="true"]'
+      )].filter((el) => {
+        const box = el.getBoundingClientRect();
+        return box.width > 0 && box.height > 0 && !el.disabled && !el.readOnly;
+      });
+      if (inputs.length) {
+        const parts = answer.split(BLANK_SEP);
+        let filled = 0;
+        for (let j = 0; j < Math.min(inputs.length, parts.length); j += 1) {
+          const el = inputs[j];
+          if (el.isContentEditable) {
+            el.textContent = parts[j];
+            el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: parts[j] }));
+          } else {
+            const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, "value");
+            if (setter && setter.set) setter.set.call(el, parts[j]);
+            else el.value = parts[j];
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          filled += 1;
+        }
+        if (filled) { painted += 1; await sleep(120); }
+      }
+    }
+    return painted;
+  }
+
   /** 服务器上这套题到底答了几题（以服务器为准，不看页面） */
   async function serverAnswered(info) {
+    await ensureTaskIds(info);
     const r = await api("student/testquiz/v1/getStuTestQuizAnswer", {
       method: "POST", form: true,
       body: { stuClassId: info.sclassid, submitId: info.submitId, tmid: info.tmid },
@@ -3847,9 +4155,17 @@ function askConfirm(title, html, yesLabel = "确认交卷") {
   function rememberClickedTask() {
     document.addEventListener("click", (ev) => {
       const li = ev.target && ev.target.closest && ev.target.closest("li.contentLi");
-      if (!li) return;
-      const info = infoFromCard(li);
-      if (info.tmid) GM_setValue("lastTask", { ...info, at: Date.now() });
+      if (li) {
+        const info = infoFromCard(li);
+        if (info.tmid) GM_setValue("lastTask", { ...info, at: Date.now() });
+        return;
+      }
+      const courseTask = ev.target && ev.target.closest && ev.target.closest(".lookTaskBottom");
+      if (!courseTask) return;
+      const info = infoFromCourseCard(courseTask);
+      if (!info || !info.tmid) return;
+      GM_setValue("lastTask", { ...info, at: Date.now() });
+      logLine("info", `已记录历史课堂任务：tmid=${info.tmid} tcid=${info.tcid || "-"} sclassid=${info.sclassid || "-"}`);
     }, true);
   }
 
@@ -3889,8 +4205,10 @@ function askConfirm(title, html, yesLabel = "确认交卷") {
     // 提交队列：到点的在这里自动交卷（任何 csgmooc 页面都会检查，关掉页面也不影响下次继续）
     setTimeout(() => processSubmitQueue(), 2500);
     setInterval(() => processSubmitQueue(), 20000);
-    if (location.pathname.endsWith("stud_task.html")) {
-      rememberClickedTask();
+    const isTaskList = location.pathname.endsWith("stud_task.html");
+    const isCourseTaskList = location.pathname.endsWith("stud_teachTask.html");
+    if (isTaskList || isCourseTaskList) rememberClickedTask();
+    if (isTaskList) {
       const timer = setInterval(() => {
         if (decorateTaskCards() > 0) { clearInterval(timer); log("任务卡片已加按钮"); }
       }, 1500);
@@ -3922,8 +4240,8 @@ function askConfirm(title, html, yesLabel = "确认交卷") {
   window.__yzj = {
     VERSION: YZJ_VERSION, CFG,
     selfCheck, serverAnswered, readScore, submitByApi, submitViaApi, verifyGraded,
-    finalizeNow, answerOne, judgeTask, writeTask, runForTask, batchAll,
-    infoFromCard, explainError,
+    finalizeNow, answerOne, judgeTask, writeTask, collectCurrentTestImages, paintCurrentTestAnswers, runForTask, batchAll,
+    infoFromCard, infoFromCourseCard, ensureTaskIds, explainError,
     histAll, histAdd, histUpdate, histCsv, lowConfItems, unsupportedTypes, openHistory,
     openSettings,
     openLog, logText, logLine, flushLog,
@@ -3931,7 +4249,7 @@ function askConfirm(title, html, yesLabel = "确认交卷") {
     deliverSubmit, enqueueSubmit, submitQueueAll, processSubmitQueue,
     uaTick, uaStart, uaStop, buildPrompt, buildTextPrompt, askAI, esc,
     bankKeys, bankPut, bankLookup, bankDel, bankStats, bankAll, bankLearn, openBank,
-    imageFingerprints, dHash64, normText, hash32, applyScoreAndLearn,
+    imageFingerprints, fetchImageBlob, gmFetchImageBlob, upscaleImageBlob, dHash64, normText, hash32, applyScoreAndLearn,
     hammingHex,
     // v1.4.0
     inspectTask, normalizeAnswer, matchSkipRule, questionPlainText, optionLetters,
